@@ -1,0 +1,4 @@
+alembic==1.4.0
+boto3==1.9.86
+psycopg2-binary==2.8.4
+sqlalchemy-utils==0.36.8

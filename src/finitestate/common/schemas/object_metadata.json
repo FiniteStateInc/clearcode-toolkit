@@ -1,0 +1,11 @@
+{
+    "$schema"	 : "http://json-schema.org/draft-04/schema#",
+    "title"	 : "Schema for standard object metadata",
+    "type"	 : "object",
+    "required"	 : ["object_id", "created_at", "commit_hash"],
+    "properties" : {
+	"object_id"   : { "type" : "string" },
+	"created_at"  : { "type" : "number" },
+	"commit_hash" : { "type" : "string" }
+    }
+}

@@ -1,0 +1,21 @@
+{
+  "$schema": "http://json-schema.org/draft-04/schema#",
+  "title": "Schema for NewDeviceObserved event",
+  "type": "object",
+  "properties": {
+    "metadata": { "$ref": "custom://object_metadata" },
+    "payload": {
+      "type": "object",
+      "properties": {
+        "event_metadata": { "$ref": "custom://event_metadata" },
+        "event_payload": {
+          "type": "object",
+          "properties": {
+            "aggregate_id": { "type": "string" },
+            "time_seen": { "type": "number" }
+          }
+        }
+      }
+    }
+  }
+}

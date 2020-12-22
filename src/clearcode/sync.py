@@ -20,6 +20,7 @@
 import click
 import gzip
 import json
+import logging
 import os
 import pickle
 import requests
@@ -35,9 +36,9 @@ from django.utils import timezone
 
 from clearcode import cdutils
 
-from clearcode.finitestate.fs_clearcode import construct_file_tree, construct_ground_truth_upload_metadata, get_package_json
-from clearcode.finitestate.storage.aws_adapter import FSAWSStorageAdapter
-
+from clearcode.fs_clearcode import construct_file_tree, construct_ground_truth_upload_metadata, get_package_json, trigger_package_metadata_plugin
+from finitestate.firmware.plugins.storage import FSAWSStorageAdapter
+from finitestate.firmware.aws.s3 import upload_data_to_s3
 
 """
 Fetch the latest definitions and harvests from ClearlyDefined
@@ -69,7 +70,13 @@ changed.
 TRACE = False
 FILE_BUCKET = "finitestate-software-component-dev2-scraper"
 METADATA_BUCKET = "finitestate-software-component-dev2-scraper"
+ALLOWED_COORDINATE_TYPES = {'npm'}
 fs_storage_adapter = FSAWSStorageAdapter(FILE_BUCKET, METADATA_BUCKET)
+
+logger = logging.getLogger(__name__)
+
+# A dictionary to hold our data
+harvest_dict = dict()
 
 # TODO: update when this is updated upstream
 # https://github.com/clearlydefined/service/blob/master/schemas/definition-1.0.json#L17
@@ -89,7 +96,6 @@ known_types = (
     # 'crate',
     # 'pod',
 )
-
 
 # each process gets its own session
 session = requests.Session()
@@ -112,7 +118,7 @@ def fetch_and_save_latest_definitions(
         from clearcode import dbconf
         dbconf.configure(verbose=verbose)
 
-    definitions_url = cdutils.append_path_to_url(base_api_url, extra_path='definitions')
+    definitions_url = cdutils.append_path_to_url(base_api_url, extra_path='definitions?type=npm')
     if by_latest:
         definitions_url = cdutils.update_url(definitions_url, qs_mapping=dict(sort='releaseDate', sortDesc='true'))
 
@@ -143,11 +149,14 @@ def fetch_and_save_latest_definitions(
         # we received a batch of definitions: let's save each as a Gzipped JSON
         for definition in definitions:
             coordinate = cdutils.Coordinate.from_dict(definition['coordinates'])
-            for saver in savers:
-                blob_path, _size = save_def(
-                    coordinate=coordinate, content=definition, output_dir=output_dir,
-                    saver=saver)
-            yield coordinate, blob_path
+            coordinate_dict = definition['coordinates']
+            if coordinate_dict['type'] in ALLOWED_COORDINATE_TYPES:
+                for saver in savers:
+                    blob_path, _size = save_def(
+                        coordinate=coordinate, content=definition, output_dir=output_dir,
+                        saver=saver)
+                yield coordinate, blob_path
+
 
 
 def fetch_definitions(api_url, cache, retries=1, verbose=True):
@@ -233,31 +242,6 @@ def file_saver(content, blob_path, output_dir, **kwargs):
     return len(compressed)
 
 
-# TODO: Upload package.json to the files bucket
-# with filename package_json_sha256_digest
-# and send SQS message to package metadata plugin to handle
-# this package
-
-
-# Other stuff:
-# - If any of our three required items are missing:
-#   - file_tree
-#   - ground_truth_upload_metadata
-#   - package.json
-#   we need to do nothing interesting, because it will 'splode
-#   the package metadata plugin downstream.
-
-def write_jsonl_to_s3(bucket: str, key: str, content: dict) -> None:
-    """
-    TODO: This is a stand-in
-    """
-
-    if not os.path.isdir(bucket):
-        os.makedirs(bucket)
-    with open(f'{bucket}/{key}.json', 'w') as file_handle:
-        json.dump(content, file_handle)
-
-
 def finitestate_saver(content, blob_path, **kwargs):
     # We will conditionally switch on output folder, as we don't care
     # for definitions, only harvests. We still need the definitions:
@@ -271,29 +255,52 @@ def finitestate_saver(content, blob_path, **kwargs):
     # TODO: We won't really need this directory. It is a stand-in for testing.
     if not os.path.isdir(output_folder):
         os.makedirs(output_folder)
-    if output_folder == 'harvests' and data['_metadata']['type'] == 'npm':
+    if output_folder == 'harvests':
+        package_url = data['_metadata']['url']
+        data_type = data['_metadata']['type']
+        # If we've never seen this package before, let's
+        # add it to our dataset
+        if package_url not in harvest_dict:
+            harvest_dict[package_url] = {
+                'harvest': None,
+                'scancode': None
+            }
+        if data_type == 'scancode':
+            harvest_dict[package_url]['scancode'] = data
+        if data_type == 'npm':
+            harvest_dict[package_url]['harvest'] = data
+        if harvest_dict[package_url]['scancode'] and harvest_dict[package_url]['harvest']:
+            harvest_data: dict = harvest_dict[package_url]['harvest']
+            scancode_data: dict = harvest_dict[package_url]['scancode']
+            package_hash: str = harvest_data['summaryInfo']['hashes']['sha256']
 
-        package_name: str = os.path.basename(data['registryData']['manifest']['name'])
-        package_version: str = data['registryData']['manifest']['version']
-        output_filename: str = f'{package_name}_{package_version}.json'
+            try:
+                file_tree: List[dict] = construct_file_tree(package_hash, harvest_data, scancode_data)
+            except Exception:
+                logger.exception("It kill:")
 
-        package_hash: str = data['summaryInfo']['hashes']['sha256']
 
-        file_tree: List[dict] = construct_file_tree(package_hash, data)
+            ground_truth_upload_metadata: dict = construct_ground_truth_upload_metadata(package_hash, harvest_data)
 
-        ground_truth_upload_metadata: dict = construct_ground_truth_upload_metadata(package_hash, data)
+            package_json_data: dict = get_package_json(file_tree, harvest_data)
 
-        package_json_data: dict = get_package_json(file_tree, data)
-
-        print("Writing file tree to S3")
-        try:
             fs_storage_adapter.store_metadata(file_id=package_hash, output_location="file_tree", result=file_tree)
-        except Exception as e:
-            print(f"Error: {e}")
 
-        # write_jsonl_to_s3("file_tree", output_filename, file_tree)
-        write_jsonl_to_s3("ground_truth_upload_metadata", output_filename, ground_truth_upload_metadata)
-        write_jsonl_to_s3("package_jsons", output_filename, package_json_data["package_json"])
+            # write_jsonl_to_s3("file_tree", output_filename, file_tree)
+            fs_storage_adapter.store_metadata_bytes(file_id=package_hash,
+                                                    output_location="ground_truth_upload_metadata",
+                                                    data=json.dumps(ground_truth_upload_metadata))
+
+            print(f"package.json hash is {package_json_data['package_json_hash']} for package {package_hash}")
+            upload_data_to_s3(bucket=FILE_BUCKET,
+                              key=package_json_data['package_json_hash'],
+                              data=json.dumps(package_json_data['package_json'], indent=True))
+
+            trigger_package_metadata_plugin(package_hash)
+
+            # We have completed processing and don't want to leak memory; let's
+            # remove the data from our dictionary.
+            del harvest_dict[package_url]
 
 
 def db_saver(content, blob_path, **kwargs):
@@ -426,7 +433,7 @@ class Cache(object):
     @classmethod
     def load_from_disk(cls):
         with open('.cache', 'rb') as file_handle:
-            return cls(pickle.load(file_handle))
+            return pickle.load(file_handle)
 
     def is_fetched(self, checksum, url):
         """
@@ -569,6 +576,7 @@ def cli(output_dir=None, save_to_db=False, save_to_fstate=False,
     cache = None
     if Cache.local_cache_exists():
         cache = Cache.load_from_disk()
+        print(f"Cache max size: {cache.max_size}")
     else:
         cache = Cache(max_size=10 * 1000 * 1000)
 
@@ -637,10 +645,10 @@ def cli(output_dir=None, save_to_db=False, save_to_fstate=False,
                             kwds=kwds,
                             callback=cache.add_args)
 
-                    if max_def and max_def >= cycle_defs_count:
+                    if max_def and max_def <= cycle_defs_count:
                         break
 
-                if max_def and (max_def >= cycle_defs_count or max_def >= total_defs_count):
+                if max_def and (max_def <= cycle_defs_count or max_def <= total_defs_count):
                     break
 
             total_defs_count += cycle_defs_count
@@ -667,8 +675,8 @@ def cli(output_dir=None, save_to_db=False, save_to_fstate=False,
     except KeyboardInterrupt:
         click.secho('\nAborted with Ctrl+C!', fg='red', err=True)
         return
-    except Exception as e:
-        print(f"Some error occured: {e}")
+    except Exception:
+        logger.exception("It asplode.")
     finally:
         if log_file:
             log_file_fn.close()

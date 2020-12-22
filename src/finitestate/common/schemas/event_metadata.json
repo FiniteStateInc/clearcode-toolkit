@@ -1,0 +1,22 @@
+{
+  "$schema": "http://json-schema.org/draft-04/schema#",
+  "title": "Schema for standard event metadata",
+  "type": "object",
+  "required": [
+    "event_id",
+    "event_type",
+    "organization_id",
+    "aggregate_id",
+    "occurred_at"
+  ],
+  "properties": {
+    "event_id": { "type": "string" },
+    "organization_id": { "type": "integer" },
+    "aggregate_id": { "type": "string" },
+    "occurred_at": { "type": "number" },
+    "event_type": {
+      "type": "string",
+      "enum": ["MalwareDownload", "NewDeviceObserved"]
+    }
+  }
+}
