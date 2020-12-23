@@ -36,9 +36,7 @@ from django.utils import timezone
 
 from clearcode import cdutils
 
-from clearcode.fs_clearcode import construct_file_tree, construct_ground_truth_upload_metadata, get_package_json, trigger_package_metadata_plugin
-from finitestate.firmware.plugins.storage import FSAWSStorageAdapter
-from finitestate.firmware.aws.s3 import upload_data_to_s3
+from clearcode.fs_clearcode import get_harvest_parser
 
 """
 Fetch the latest definitions and harvests from ClearlyDefined
@@ -68,8 +66,7 @@ changed.
 """
 
 TRACE = False
-FILE_BUCKET = "finitestate-firmware-dev2-files"
-METADATA_BUCKET = "finitestate-firmware-dev2-metadata"
+
 fs_storage_adapter = FSAWSStorageAdapter(FILE_BUCKET, METADATA_BUCKET)
 
 logger = logging.getLogger(__name__)
@@ -254,41 +251,29 @@ def finitestate_saver(content, blob_path, **kwargs):
         os.makedirs(output_folder)
     if output_folder == 'harvests':
         package_url = data['_metadata']['url']
-        data_type = data['_metadata']['type']
+        package_type = data['_metadata']['type']
         # If we've never seen this package before, let's
         # add it to our dataset
         if package_url not in harvest_dict:
             harvest_dict[package_url] = {
-                'harvest': None,
-                'scancode': None
+                'clearlydefined': None,
+                'scancode': None,
+                'type': None
             }
-        if data_type == 'scancode':
+        if package_type == 'scancode':
             harvest_dict[package_url]['scancode'] = data
-        if data_type == 'npm':
-            harvest_dict[package_url]['harvest'] = data
-        if harvest_dict[package_url]['scancode'] and harvest_dict[package_url]['harvest']:
-            harvest_data: dict = harvest_dict[package_url]['harvest']
+        # We must be looking at a valid packaging type
+        if package_type in cdutils.PACKAGE_TYPES_BY_PURL_TYPE:
+            harvest_dict[package_url]['clearlydefined'] = data
+            harvest_dict[package_url]['type'] = package_type
+
+        if harvest_dict[package_url]['scancode'] and harvest_dict[package_url]['clearlydefined']:
+            clearlydefined_data: dict = harvest_dict[package_url]['clearlydefined']
             scancode_data: dict = harvest_dict[package_url]['scancode']
-            package_hash: str = harvest_data['summaryInfo']['hashes']['sha256']
+            package_hash: str = clearlydefined_data['summaryInfo']['hashes']['sha256']
 
-            file_tree: List[dict] = construct_file_tree(package_hash, harvest_data, scancode_data)
-
-            ground_truth_upload_metadata: dict = construct_ground_truth_upload_metadata(package_hash, harvest_data)
-
-            package_json_data: dict = get_package_json(file_tree, harvest_data)
-
-            fs_storage_adapter.store_metadata(file_id=package_hash, output_location="file_tree", result=file_tree)
-
-            fs_storage_adapter.store_metadata_bytes(file_id=package_hash,
-                                                    output_location="ground_truth_upload_metadata",
-                                                    data=json.dumps(ground_truth_upload_metadata))
-
-            print(f"package.json hash is {package_json_data['package_json_hash']} for package {package_hash}")
-            upload_data_to_s3(bucket=FILE_BUCKET,
-                              key=package_json_data['package_json_hash'],
-                              data=json.dumps(package_json_data['package_json'], indent=True))
-
-            trigger_package_metadata_plugin(package_hash)
+            harvest_parser = get_harvest_parser(package_type, package_hash, clearlydefined_data, scancode_data)
+            harvest_parser.parse()
 
             # We have completed processing and don't want to leak memory; let's
             # remove the data from our dictionary.
