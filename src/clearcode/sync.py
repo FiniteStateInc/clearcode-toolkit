@@ -70,7 +70,6 @@ changed.
 TRACE = False
 FILE_BUCKET = "finitestate-firmware-dev2-files"
 METADATA_BUCKET = "finitestate-firmware-dev2-metadata"
-ALLOWED_COORDINATE_TYPES = {'npm'}
 fs_storage_adapter = FSAWSStorageAdapter(FILE_BUCKET, METADATA_BUCKET)
 
 logger = logging.getLogger(__name__)
@@ -150,14 +149,11 @@ def fetch_and_save_latest_definitions(
         # we received a batch of definitions: let's save each as a Gzipped JSON
         for definition in definitions:
             coordinate = cdutils.Coordinate.from_dict(definition['coordinates'])
-            coordinate_dict = definition['coordinates']
-            if coordinate_dict['type'] in ALLOWED_COORDINATE_TYPES:
-                for saver in savers:
-                    blob_path, _size = save_def(
-                        coordinate=coordinate, content=definition, output_dir=output_dir,
-                        saver=saver)
-                yield coordinate, blob_path
-
+            for saver in savers:
+                blob_path, _size = save_def(
+                    coordinate=coordinate, content=definition, output_dir=output_dir,
+                    saver=saver)
+            yield coordinate, blob_path
 
 
 def fetch_definitions(api_url, cache, retries=1, verbose=True):
