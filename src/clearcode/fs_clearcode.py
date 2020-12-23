@@ -162,8 +162,8 @@ def trigger_package_metadata_plugin(package_hash: str):
     print(
         f"SQS Message to send: QueueUrl: {queue_url}, MessageBody: {message.serialize()}"
     )
-    # get_sqs_client().send_message(
-    #     QueueUrl=queue_url,
-    #     MessageBody=message.serialize()
-    # )
+    get_sqs_client().send_message(
+        QueueUrl=queue_url,
+        MessageBody=message.serialize()
+    )
 

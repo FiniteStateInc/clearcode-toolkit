@@ -68,8 +68,8 @@ changed.
 """
 
 TRACE = False
-FILE_BUCKET = "finitestate-software-component-dev2-scraper"
-METADATA_BUCKET = "finitestate-software-component-dev2-scraper"
+FILE_BUCKET = "finitestate-firmware-dev2-files"
+METADATA_BUCKET = "finitestate-firmware-dev2-metadata"
 ALLOWED_COORDINATE_TYPES = {'npm'}
 fs_storage_adapter = FSAWSStorageAdapter(FILE_BUCKET, METADATA_BUCKET)
 
@@ -81,8 +81,8 @@ harvest_dict = dict()
 # TODO: update when this is updated upstream
 # https://github.com/clearlydefined/service/blob/master/schemas/definition-1.0.json#L17
 known_types = (
-    # fake empty type
-    None,
+    # None gets _all definitions_ from the definition endpoint.
+    # None,
     'npm',
     # 'git',
     # 'pypi',
@@ -118,7 +118,8 @@ def fetch_and_save_latest_definitions(
         from clearcode import dbconf
         dbconf.configure(verbose=verbose)
 
-    definitions_url = cdutils.append_path_to_url(base_api_url, extra_path='definitions?type=npm')
+    definitions_url = cdutils.append_path_to_url(base_api_url, extra_path='definitions')
+
     if by_latest:
         definitions_url = cdutils.update_url(definitions_url, qs_mapping=dict(sort='releaseDate', sortDesc='true'))
 
@@ -274,11 +275,7 @@ def finitestate_saver(content, blob_path, **kwargs):
             scancode_data: dict = harvest_dict[package_url]['scancode']
             package_hash: str = harvest_data['summaryInfo']['hashes']['sha256']
 
-            try:
-                file_tree: List[dict] = construct_file_tree(package_hash, harvest_data, scancode_data)
-            except Exception:
-                logger.exception("It kill:")
-
+            file_tree: List[dict] = construct_file_tree(package_hash, harvest_data, scancode_data)
 
             ground_truth_upload_metadata: dict = construct_ground_truth_upload_metadata(package_hash, harvest_data)
 
@@ -286,7 +283,6 @@ def finitestate_saver(content, blob_path, **kwargs):
 
             fs_storage_adapter.store_metadata(file_id=package_hash, output_location="file_tree", result=file_tree)
 
-            # write_jsonl_to_s3("file_tree", output_filename, file_tree)
             fs_storage_adapter.store_metadata_bytes(file_id=package_hash,
                                                     output_location="ground_truth_upload_metadata",
                                                     data=json.dumps(ground_truth_upload_metadata))
@@ -404,7 +400,7 @@ class Cache(object):
     A caching object for etags and checksums to avoid refetching things.
     """
 
-    def __init__(self, max_size=100 * 1000 * 1000):
+    def __init__(self, max_size=10 * 1000 * 1000):
         self.etags_cache = dict()
         self.checksums_cache = dict()
         self.max_size = max_size
@@ -598,7 +594,6 @@ def cli(output_dir=None, save_to_db=False, save_to_fstate=False,
             start = time.time()
             cycles += 1
             cycle_defs_count = 0
-
             # iterate all types to get more depth for the latest defs.
             for def_type in known_types:
                 sleeping = False
@@ -622,6 +617,9 @@ def cli(output_dir=None, save_to_db=False, save_to_fstate=False,
                 for coordinate, file_path in definitions:
 
                     cycle_defs_count += 1
+                    if (cycle_defs_count + total_defs_count % 1000 == 0):
+                        print("Caching for posterity.")
+                        cache.dump_to_disk()
 
                     if log_file:
                         log_file_fn.write(file_path.partition('.gz')[0] + '\n')
