@@ -4,9 +4,9 @@ import os
 import re
 import uuid
 
-from abc import ABC
+from abc import ABC, abstractmethod
 from datetime import datetime
-from typing import List
+from typing import List, Union
 from urllib.parse import urlparse
 
 from finitestate.firmware.aws.s3 import upload_data_to_s3
@@ -36,7 +36,7 @@ def get_storage_adapter():
 def get_sqs_client():
     global sqs_client
     if not sqs_client:
-        sqs_client = boto3.get_client('sqs')
+        sqs_client = boto3.client('sqs', region_name=REGION)
     return sqs_client
 
 
@@ -79,7 +79,6 @@ class HarvestParser(ABC):
                     }
                 else:
                     transformed_data[file_entry['path']]['scancode_info'] = file_entry
-
 
         # Construct the file tree using the transformed data
         file_tree = list()
@@ -138,11 +137,11 @@ class HarvestParser(ABC):
         return {
             'additional_metadata': {
                 'upload_date': self.clearlydefined_data['registryData']['releaseDate'],
-                'license': self.clearlydefined_data['registryData']['license'],
+                'license': self.clearlydefined_data['registryData'].get('license'),
                 'project_name': self.clearlydefined_data['registryData']['name'],
-                'home_page': self.clearlydefined_data['registryData']['homepage'],
-                'file_count': self.clearlydefined_data['registryData']['manifest']['dist']['fileCount'],
-                'description': self.clearlydefined_data['registryData']['manifest']['description'],
+                'home_page': self.clearlydefined_data['registryData'].get('homepage'),
+                'file_count': self.clearlydefined_data['registryData']['manifest']['dist'].get('fileCount', self.clearlydefined_data['summaryInfo'].get('count', None)),
+                'description': self.clearlydefined_data['registryData']['manifest'].get('description'),
                 'package_version': self.clearlydefined_data['registryData']['manifest']['version']
             },
             'download_date': str(datetime.utcnow()),
@@ -161,22 +160,32 @@ class HarvestParser(ABC):
                                             fwan_process_id=str(uuid.uuid4()),
                                             trigger_downstream_plugins=True)
         print(
-            f"SQS Message to send: QueueUrl: {queue_url}, MessageBody: {message.serialize()}"
+            f"{self.package_hash} -> SQS"
         )
         get_sqs_client().send_message(
             QueueUrl=queue_url,
             MessageBody=message.serialize()
         )
 
+    @abstractmethod
+    def _construct_standardized_metadata(self) -> Union[dict, None]:
+        raise NotImplementedError("Function not implemented!")
+
     def parse(self):
-        file_tree: List[dict] = self._construct_file_tree(self.package_hash, self.clearlydefined_data, self.scancode_data)
-        ground_truth_upload_metadata: dict = self._construct_ground_truth_upload_metadata(self.package_hash, self.clearlydefined_data)
+        file_tree: List[dict] = self._construct_file_tree()
+        ground_truth_upload_metadata: dict = self._construct_ground_truth_upload_metadata()
 
         storage_adapter.store_metadata(file_id=self.package_hash, output_location="file_tree", result=file_tree)
 
         storage_adapter.store_metadata_bytes(file_id=self.package_hash,
                                              output_location="ground_truth_upload_metadata",
                                              data=json.dumps(ground_truth_upload_metadata))
+
+        standardized_package_metadata = self._construct_standardized_metadata()
+        if standardized_package_metadata is not None:
+            storage_adapter.store_metadata(file_id=self.package_hash,
+                                           output_location="package_metadata/standardized",
+                                           result=[standardized_package_metadata])
 
 
 class NPMHarvestParser(HarvestParser):
@@ -203,6 +212,15 @@ class NPMHarvestParser(HarvestParser):
             'package_json': package_json
         }
 
+    def _construct_standardized_metadata(self):
+        """
+        Returns none because the NPM harvester doesn't need to be publishing
+        standardized metadata; the package metadata plugin can handle that.
+        The original package.json content is provided verbatim, so we can
+        forward it to S3 for processing.
+        """
+        return None
+
     def parse(self):
         # Do everything defined in ABC
         super().parse()
@@ -211,11 +229,11 @@ class NPMHarvestParser(HarvestParser):
                           key=package_json_data['package_json_hash'],
                           data=json.dumps(package_json_data['package_json'], indent=True))
 
-        self.trigger_package_metadata_plugin()
+        self._trigger_package_metadata_plugin()
 
 
 def get_harvest_parser(package_type: str, package_hash: str, clearlydefined_data: dict, scancode_data: dict) -> HarvestParser:
     if package_type == 'npm':
         return NPMHarvestParser(package_hash, clearlydefined_data, scancode_data)
     else:
-        raise NotImplementedError(f"Harvest Parser not implemented for package type {package_type}")
+        raise NotImplementedError(f"Harvest Parser not implemented for package type {package_type}!")

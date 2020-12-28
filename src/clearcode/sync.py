@@ -25,12 +25,15 @@ import os
 import pickle
 import requests
 import time
+import tracemalloc
 
 from typing import List
 
 from datetime import datetime
+from expiring_dict import ExpiringDict
 from multiprocessing import pool
 from os import path
+from random import randrange
 
 from django.utils import timezone
 
@@ -64,15 +67,19 @@ latest date, we can repeat this every few minutes or so forever to catch any
 update. We use etags and a cache to avoid refetching things that have not
 changed.
 """
+tracemalloc.start()
 
 TRACE = False
-
-fs_storage_adapter = FSAWSStorageAdapter(FILE_BUCKET, METADATA_BUCKET)
+HARVEST_TTL = 60
+HARVEST_TTL_INTERVAL = 5
 
 logger = logging.getLogger(__name__)
 
 # A dictionary to hold our data
-harvest_dict = dict()
+# In order to avoid memory leakage, we need to expire items
+# in this cache after HARVEST_TTL seconds
+# We should check for things to expire every HARVEST_TTL_INTERVAL seconds
+harvest_dict = ExpiringDict(ttl=HARVEST_TTL, interval=HARVEST_TTL_INTERVAL)
 
 # TODO: update when this is updated upstream
 # https://github.com/clearlydefined/service/blob/master/schemas/definition-1.0.json#L17
@@ -139,13 +146,14 @@ def fetch_and_save_latest_definitions(
             savers.append(db_saver)
         if output_dir:
             savers.append(file_saver)
-        if save_to_fstate:
-            output_dir = 'definitions'
-            savers.append(finitestate_saver)
+        # if save_to_fstate:
+        #     output_dir = 'definitions'
+        #     savers.append(finitestate_saver)
 
         # we received a batch of definitions: let's save each as a Gzipped JSON
         for definition in definitions:
             coordinate = cdutils.Coordinate.from_dict(definition['coordinates'])
+            blob_path = None
             for saver in savers:
                 blob_path, _size = save_def(
                     coordinate=coordinate, content=definition, output_dir=output_dir,
@@ -272,8 +280,11 @@ def finitestate_saver(content, blob_path, **kwargs):
             scancode_data: dict = harvest_dict[package_url]['scancode']
             package_hash: str = clearlydefined_data['summaryInfo']['hashes']['sha256']
 
-            harvest_parser = get_harvest_parser(package_type, package_hash, clearlydefined_data, scancode_data)
-            harvest_parser.parse()
+            try:
+                harvest_parser = get_harvest_parser(harvest_dict[package_url]['type'], package_hash, clearlydefined_data, scancode_data)
+                harvest_parser.parse()
+            except Exception:
+                logger.exception("It's broken:")
 
             # We have completed processing and don't want to leak memory; let's
             # remove the data from our dictionary.
@@ -381,7 +392,7 @@ class Cache(object):
     A caching object for etags and checksums to avoid refetching things.
     """
 
-    def __init__(self, max_size=10 * 1000 * 1000):
+    def __init__(self, max_size=100 * 1000):
         self.etags_cache = dict()
         self.checksums_cache = dict()
         self.max_size = max_size
@@ -555,7 +566,7 @@ def cli(output_dir=None, save_to_db=False, save_to_fstate=False,
         cache = Cache.load_from_disk()
         print(f"Cache max size: {cache.max_size}")
     else:
-        cache = Cache(max_size=10 * 1000 * 1000)
+        cache = Cache(max_size=100 * 1000)
 
     sleeping = False
     harvest_fetchers = None
@@ -566,7 +577,7 @@ def cli(output_dir=None, save_to_db=False, save_to_fstate=False,
 
     try:
         if fetch_harvests:
-            harvest_fetchers = pool.Pool(processes=processes, maxtasksperchild=10000)
+            harvest_fetchers = pool.Pool(processes=processes)  #, maxtasksperchild=10)
 
         # loop forever. Complete one loop once we have fetched all the latest
         # items and we are not getting new pages (based on etag)
@@ -597,10 +608,18 @@ def cli(output_dir=None, save_to_db=False, save_to_fstate=False,
 
                 for coordinate, file_path in definitions:
 
+                    # if randrange(1000) == 6:
+                    #     snapshot = tracemalloc.take_snapshot()
+                    #     top_stats = snapshot.statistics('lineno')
+                    #     print("=============== MEMORY USAGE TOP 25 LINES ================")
+                    #     for stat in top_stats[:25]:
+                    #         print(stat)
+                    #     print("==========================================================")
                     cycle_defs_count += 1
-                    if (cycle_defs_count + total_defs_count % 1000 == 0):
+                    if (cycle_defs_count + total_defs_count) % 1000 == 0:
                         print("Caching for posterity.")
                         cache.dump_to_disk()
+                        cache.trim()
 
                     if log_file:
                         log_file_fn.write(file_path.partition('.gz')[0] + '\n')
@@ -653,9 +672,10 @@ def cli(output_dir=None, save_to_db=False, save_to_fstate=False,
 
     except KeyboardInterrupt:
         click.secho('\nAborted with Ctrl+C!', fg='red', err=True)
+
         return
-    except Exception:
-        logger.exception("It asplode.")
+    except Exception as e:
+        raise e
     finally:
         if log_file:
             log_file_fn.close()
