@@ -31,7 +31,9 @@ from typing import List
 
 from datetime import datetime
 from expiring_dict import ExpiringDict
-from multiprocessing import pool
+from itertools import repeat
+# from multiprocessing import pool
+from .logging_pool import LoggingPool
 from os import path
 from random import randrange
 
@@ -67,7 +69,7 @@ latest date, we can repeat this every few minutes or so forever to catch any
 update. We use etags and a cache to avoid refetching things that have not
 changed.
 """
-tracemalloc.start()
+tracemalloc.start(25)
 
 TRACE = False
 HARVEST_TTL = 60
@@ -101,7 +103,8 @@ known_types = (
 )
 
 # each process gets its own session
-session = requests.Session()
+global_session = requests.Session()
+
 
 
 def fetch_and_save_latest_definitions(
@@ -139,7 +142,8 @@ def fetch_and_save_latest_definitions(
             last = cdutils.coord2str(definitions[-1]['coordinates'])
             print('Fetched definitions from :', first, 'to:', last, flush=True)
         else:
-            print('.', end='', flush=True)
+            pass
+            # print('.', end='', flush=True)
 
         savers = []
         if save_to_db:
@@ -180,7 +184,10 @@ def fetch_definitions(api_url, cache, retries=1, verbose=True):
     max_errors = 5
     while True:
         try:
-            content = cache.get_content(api_url, retries=retries, session=session)
+            # SAMV 12 29 We modified the cache to always return the tuple; make sure we call correctly
+            # content = cache.get_content(api_url, retries=retries, session=global_session)
+            etag, checksum, content = cache.get_content(api_url, retries=retries, session=global_session)
+
             if not content:
                 break
             content = json.loads(content)
@@ -245,6 +252,9 @@ def file_saver(content, blob_path, output_dir, **kwargs):
 
 
 def finitestate_saver(content, blob_path, **kwargs):
+    # if True:
+    #     return
+    # else:
     # We will conditionally switch on output folder, as we don't care
     # for definitions, only harvests. We still need the definitions:
     # without them, we cannot hope to harvest.
@@ -342,21 +352,29 @@ def save_harvest(
 
 def fetch_and_save_harvests(
         coordinate, cache, output_dir=None, save_to_db=False,
-        save_to_fstate=False, retries=2, session=session, verbose=True):
+        save_to_fstate=False, retries=2, session=None, verbose=True):
     """
     Fetch all the harvests for `coordinate` Coordinate object and save them in
     `outputdir` using blob-style paths, one file for each harvest/scan.
 
     (Note: Return a tuple of (etag, md5, url) for usage as a callback)
     """
+    if not session:
+        session = requests.Session()
     assert output_dir or save_to_db or save_to_fstate, 'You must select one of the --output-dir or --save-to-db or --save_to_fstate options.'
     if save_to_db:
         from clearcode import dbconf
         dbconf.configure(verbose=verbose)
 
     url = coordinate.get_harvests_api_url()
-    etag, checksum, content = cache.get_content(
-        url, retries=retries, session=session, with_cache_keys=True)
+
+    # SAMV 12 29 let's not use the cache for this
+    # etag, checksum, content = cache.get_content(
+    #     url, retries=retries, session=session, with_cache_keys=True)
+
+    etag, checksum, content = cdutils.get_response_content(
+        url, retries=retries, session=session
+        )
 
     if content:
         savers = []
@@ -371,7 +389,8 @@ def fetch_and_save_harvests(
         if verbose:
             print('  Fetched harvest for:', coordinate.to_api_path(), flush=True)
         else:
-            print('.', end='', flush=True)
+            pass
+            # print('.', end='', flush=True)
 
         for tool, versions in json.loads(content).items():
             for tool_version, harvest in versions.items():
@@ -393,22 +412,26 @@ class Cache(object):
     """
 
     def __init__(self, max_size=100 * 1000):
-        self.etags_cache = dict()
-        self.checksums_cache = dict()
+        # self.etags_cache = dict()
+        # self.checksums_cache = dict()
         self.max_size = max_size
 
-    def is_unchanged_remotely(self, url, session=session):
+    def is_unchanged_remotely(self, url, session=None):
         """
         Return True if a `url` content is unchanged from cache based on HTTP
         HEADER Etag.
         """
-        try:
-            response = session.head(url)
-            remote_etag = response.headers.get('etag')
-            if remote_etag and self.etags_cache.get(url) == remote_etag:
-                return True
-        except:
-            return False
+        if session is None:
+            session = requests.Session()
+        # SAMV 1229 Always return false; always go and get it, loser
+        # try:
+        #     response = session.head(url)
+        #     remote_etag = response.headers.get('etag')
+        #     if remote_etag and self.etags_cache.get(url) == remote_etag:
+        #         return True
+        # except:
+        #     return False
+        return False
 
     @classmethod
     def local_cache_exists(cls):
@@ -430,10 +453,12 @@ class Cache(object):
         return url and checksum and self.checksums_cache.get(checksum) == url
 
     def add(self, etag, checksum, url):
-        if etag:
-            self.etags_cache[url] = etag
-        if checksum:
-            self.checksums_cache[checksum] = url
+        # SAMV 1229 Pass this whole thing, no adding
+        pass
+        # if etag:
+        #     self.etags_cache[url] = etag
+        # if checksum:
+        #     self.checksums_cache[checksum] = url
 
     def add_args(self, args):
         self.add(*args)
@@ -442,21 +467,23 @@ class Cache(object):
         """
         Trim the cache to its max size.
         """
+        # Samv 1229 Pass this whole thing
+        # def _resize(cache):
+        #     extra_items = len(cache) - self.max_size
+        #     if extra_items > 0:
+        #         for ei in list(cache)[:extra_items]:
+        #             del cache[ei]
 
-        def _resize(cache):
-            extra_items = len(cache) - self.max_size
-            if extra_items > 0:
-                for ei in list(cache)[:extra_items]:
-                    del cache[ei]
+        # _resize(self.etags_cache)
+        # _resize(self.checksums_cache)
 
-        _resize(self.etags_cache)
-        _resize(self.checksums_cache)
-
-    def get_content(self, url, retries=1, session=session, with_cache_keys=False):
+    def get_content(self, url, retries=1, session=None, with_cache_keys=False):
         """
         Return fetched content as bytes or None if already fetched or unchanged.
         Updates the cache as needed.
         """
+        if session is None:
+            session = requests.Session()
         if self.is_unchanged_remotely(url=url, session=session):
             return
 
@@ -466,23 +493,24 @@ class Cache(object):
         if not content:
             return
 
-        if self.is_fetched(checksum, url):
-            return
+        return etag, checksum, content
+        # if self.is_fetched(checksum, url):
+        #     return
 
-        self.add(etag, checksum, url)
+        # self.add(etag, checksum, url)
 
-        if with_cache_keys:
-            return etag, checksum, content
-        else:
-            return content
+        # if with_cache_keys:
+        #     return etag, checksum, content
+        # else:
+        #     return content
 
     def copy(self):
         """
         Return a deep copy of self
         """
         cache = Cache(self.max_size)
-        cache.checksums_cache = dict(self.checksums_cache)
-        cache.etags_cache = dict(self.etags_cache)
+        # cache.checksums_cache = dict(self.checksums_cache)
+        # cache.etags_cache = dict(self.etags_cache)
         return cache
 
 
@@ -543,7 +571,7 @@ class Cache(object):
 def cli(output_dir=None, save_to_db=False, save_to_fstate=False,
         base_api_url='https://api.clearlydefined.io',
         wait=60, processes=1, unsorted=False,
-        log_file=None, max_def=0, only_definitions=False, session=session,
+        log_file=None, max_def=0, only_definitions=False, session=global_session,
         verbose=False, *arg, **kwargs):
     """
     Fetch the latest definitions and harvests from ClearlyDefined and save these
@@ -577,7 +605,9 @@ def cli(output_dir=None, save_to_db=False, save_to_fstate=False,
 
     try:
         if fetch_harvests:
-            harvest_fetchers = pool.Pool(processes=processes)  #, maxtasksperchild=10)
+            # harvest_fetchers = pool.Pool(processes=processes)  #, maxtasksperchild=10)
+            harvest_fetchers = LoggingPool(processes=processes,
+                                           maxtasksperchild=25)  # SAMV 1229
 
         # loop forever. Complete one loop once we have fetched all the latest
         # items and we are not getting new pages (based on etag)
@@ -607,16 +637,22 @@ def cli(output_dir=None, save_to_db=False, save_to_fstate=False,
                     verbose=verbose)
 
                 for coordinate, file_path in definitions:
-
-                    # if randrange(1000) == 6:
-                    #     snapshot = tracemalloc.take_snapshot()
-                    #     top_stats = snapshot.statistics('lineno')
-                    #     print("=============== MEMORY USAGE TOP 25 LINES ================")
-                    #     for stat in top_stats[:25]:
-                    #         print(stat)
-                    #     print("==========================================================")
                     cycle_defs_count += 1
                     if (cycle_defs_count + total_defs_count) % 1000 == 0:
+                        # print("=" * 50)
+                        # print(f"POOL CACHE SIZE: {len(harvest_fetchers._cache)}")
+                        # print("=" * 50)
+                        # if len(harvest_fetchers._cache) > 500:
+                        #     exponent = 1
+                        #     while len(harvest_fetchers._cache) > 500:
+                        #         print("=" * 50)
+                        #         print(f"POOL CACHE SIZE: {len(harvest_fetchers._cache)}")
+                        #         print("=" * 50)
+                        #         print(f"Cache 2 big. Sleeping for {2 ** exponent} seconds before asking for more harvests..")
+                        #         print("=" * 50)
+                        #         time.sleep(2 ** exponent)
+                        #         exponent += 1
+
                         print("Caching for posterity.")
                         cache.dump_to_disk()
                         cache.trim()
@@ -635,7 +671,11 @@ def cli(output_dir=None, save_to_db=False, save_to_fstate=False,
                             # that's a copy of the cache, since we are in some
                             # subprocess, the data is best not shared to avoid
                             # any sync issue
-                            cache=cache.copy(),
+                            # SAMV December 29 2020
+                            # We're gonna reuse the cache that exists so we
+                            # don't blow up memory
+                            # cache=cache.copy(),
+                            cache=None,
                             verbose=verbose)
 
                         harvest_fetchers.apply_async(
@@ -648,6 +688,21 @@ def cli(output_dir=None, save_to_db=False, save_to_fstate=False,
 
                 if max_def and (max_def <= cycle_defs_count or max_def <= total_defs_count):
                     break
+
+            # snapshot = tracemalloc.take_snapshot()
+            # top_stats = snapshot.statistics('traceback')
+
+            # print()
+            # print("=============== MEMORY USAGE TOP 10 LINES ================")
+            # for stat in top_stats[:10]:
+            #     print("THE STAT:")
+            #     print(stat)
+            #     print("THE TRACEBACK:")
+            #     print(f"{stat.count} memory blocks: {stat.size / 1024} KiB")
+            #     for line in stat.traceback.format():
+            #         print(line)
+            # print("==========================================================")
+            # print()
 
             total_defs_count += cycle_defs_count
             cycle_duration = time.time() - start
@@ -664,7 +719,8 @@ def cli(output_dir=None, save_to_db=False, save_to_fstate=False,
                 print('Cycle completed at:', datetime.utcnow().isoformat(),
                       'Sleeping for', wait, 'seconds...')
             else:
-                print('.', end='')
+                pass
+                # print('.', end='')
 
             sleeping = True
             time.sleep(wait)

@@ -1,5 +1,6 @@
 import boto3
 import json
+import logging
 import os
 import re
 import uuid
@@ -22,8 +23,21 @@ PLUGIN_NAME = 'package_metadata'
 PRIORITY = 'low'
 REGION = 'us-east-1'
 
+LOG_FILENAME = 'clearcode_scrape.log'
+MAX_LOGBYTES = 10 * 1000 * 1000
+
 sqs_client = None
 storage_adapter = None
+
+logging.basicConfig(format='%(asctime)s %(levelname)s {%(module)s} %(message)s',
+                    datefmt='%Y-%m-%d,%H:%M:%S',
+                    level=logging.INFO)
+
+logging.getLogger('finitestate.firmware.plugins.storage.aws_adapter').setLevel(logging.CRITICAL)
+logging.getLogger('botocore').setLevel(logging.CRITICAL)
+logger = logging.getLogger(__name__)
+
+sent_count = 0
 
 
 def get_storage_adapter():
@@ -159,13 +173,17 @@ class HarvestParser(ABC):
         message = FSFirmwareUnpackedMessage(firmware_id=self.package_hash,
                                             fwan_process_id=str(uuid.uuid4()),
                                             trigger_downstream_plugins=True)
-        print(
+        logger.info(
             f"{self.package_hash} -> SQS"
         )
+        global sent_count
+        sent_count += 1
         get_sqs_client().send_message(
             QueueUrl=queue_url,
             MessageBody=message.serialize()
         )
+        if sent_count % 250 == 0:
+            logger.info(f"{sent_count} packages processed.")
 
     @abstractmethod
     def _construct_standardized_metadata(self) -> Union[dict, None]:
@@ -173,6 +191,7 @@ class HarvestParser(ABC):
 
     def parse(self):
         file_tree: List[dict] = self._construct_file_tree()
+
         ground_truth_upload_metadata: dict = self._construct_ground_truth_upload_metadata()
 
         storage_adapter.store_metadata(file_id=self.package_hash, output_location="file_tree", result=file_tree)
@@ -182,6 +201,7 @@ class HarvestParser(ABC):
                                              data=json.dumps(ground_truth_upload_metadata))
 
         standardized_package_metadata = self._construct_standardized_metadata()
+
         if standardized_package_metadata is not None:
             storage_adapter.store_metadata(file_id=self.package_hash,
                                            output_location="package_metadata/standardized",
@@ -225,9 +245,12 @@ class NPMHarvestParser(HarvestParser):
         # Do everything defined in ABC
         super().parse()
         package_json_data: dict = self._get_package_json()
-        upload_data_to_s3(bucket=FILE_BUCKET,
-                          key=package_json_data['package_json_hash'],
-                          data=json.dumps(package_json_data['package_json'], indent=True))
+        try:
+            upload_data_to_s3(bucket=FILE_BUCKET,
+                              key=package_json_data['package_json_hash'],
+                              data=json.dumps(package_json_data['package_json'], indent=True))
+        except Exception:
+            raise
 
         self._trigger_package_metadata_plugin()
 
