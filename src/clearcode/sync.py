@@ -17,20 +17,31 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from datetime import datetime
+import click
 import gzip
 import json
-from multiprocessing import pool
+import logging
 import os
-from os import path
-import time
-
-import click
-from django.utils import timezone
+import pickle
 import requests
+import time
+import tracemalloc
+
+from typing import List
+
+from datetime import datetime
+from expiring_dict import ExpiringDict
+from itertools import repeat
+# from multiprocessing import pool
+from .logging_pool import LoggingPool
+from os import path
+from random import randrange
+
+from django.utils import timezone
 
 from clearcode import cdutils
 
+from clearcode.fs_clearcode import get_harvest_parser
 
 """
 Fetch the latest definitions and harvests from ClearlyDefined
@@ -58,37 +69,47 @@ latest date, we can repeat this every few minutes or so forever to catch any
 update. We use etags and a cache to avoid refetching things that have not
 changed.
 """
+tracemalloc.start(25)
 
 TRACE = False
+HARVEST_TTL = 60
+HARVEST_TTL_INTERVAL = 5
 
+logger = logging.getLogger(__name__)
+
+# A dictionary to hold our data
+# In order to avoid memory leakage, we need to expire items
+# in this cache after HARVEST_TTL seconds
+# We should check for things to expire every HARVEST_TTL_INTERVAL seconds
+harvest_dict = ExpiringDict(ttl=HARVEST_TTL, interval=HARVEST_TTL_INTERVAL)
 
 # TODO: update when this is updated upstream
 # https://github.com/clearlydefined/service/blob/master/schemas/definition-1.0.json#L17
 known_types = (
-    # fake empty type
-    None,
+    # None gets _all definitions_ from the definition endpoint.
+    # None,
     'npm',
-    'git',
-    'pypi',
-    'composer',
-    'maven',
-    'gem',
-    'nuget',
-    'sourcearchive',
-    'deb',
-    'debsrc',
-    'crate',
-    'pod',
+    # 'git',
+    # 'pypi',
+    # 'composer',
+    # 'maven',
+    # 'gem',
+    # 'nuget',
+    # 'sourcearchive',
+    # 'deb',
+    # 'debsrc',
+    # 'crate',
+    # 'pod',
 )
 
-
 # each process gets its own session
-session = requests.Session()
+global_session = requests.Session()
+
 
 
 def fetch_and_save_latest_definitions(
         base_api_url, cache, output_dir=None, save_to_db=False,
-        by_latest=True, retries=2, verbose=True):
+        save_to_fstate=False, by_latest=True, retries=2, verbose=True):
     """
     Fetch ClearlyDefined definitions and paginate through. Save these as blobs
     to data_dir.
@@ -97,13 +118,14 @@ def fetch_and_save_latest_definitions(
     Otherwise, the order is not specified.
     NOTE: these do not contain file details (but the harvest do)
     """
-    assert output_dir or save_to_db, 'You must select one of the --output-dir or --save-to-db options.'
+    assert output_dir or save_to_db or save_to_fstate, 'You must select one of the --output-dir or --save-to-db or save_to_fstate options.'
 
     if save_to_db:
         from clearcode import dbconf
         dbconf.configure(verbose=verbose)
 
     definitions_url = cdutils.append_path_to_url(base_api_url, extra_path='definitions')
+
     if by_latest:
         definitions_url = cdutils.update_url(definitions_url, qs_mapping=dict(sort='releaseDate', sortDesc='true'))
 
@@ -120,17 +142,22 @@ def fetch_and_save_latest_definitions(
             last = cdutils.coord2str(definitions[-1]['coordinates'])
             print('Fetched definitions from :', first, 'to:', last, flush=True)
         else:
-            print('.', end='', flush=True)
+            pass
+            # print('.', end='', flush=True)
 
         savers = []
         if save_to_db:
             savers.append(db_saver)
         if output_dir:
             savers.append(file_saver)
+        # if save_to_fstate:
+        #     output_dir = 'definitions'
+        #     savers.append(finitestate_saver)
 
         # we received a batch of definitions: let's save each as a Gzipped JSON
         for definition in definitions:
             coordinate = cdutils.Coordinate.from_dict(definition['coordinates'])
+            blob_path = None
             for saver in savers:
                 blob_path, _size = save_def(
                     coordinate=coordinate, content=definition, output_dir=output_dir,
@@ -157,7 +184,10 @@ def fetch_definitions(api_url, cache, retries=1, verbose=True):
     max_errors = 5
     while True:
         try:
-            content = cache.get_content(api_url, retries=retries, session=session)
+            # SAMV 12 29 We modified the cache to always return the tuple; make sure we call correctly
+            # content = cache.get_content(api_url, retries=retries, session=global_session)
+            etag, checksum, content = cache.get_content(api_url, retries=retries, session=global_session)
+
             if not content:
                 break
             content = json.loads(content)
@@ -221,6 +251,56 @@ def file_saver(content, blob_path, output_dir, **kwargs):
     return len(compressed)
 
 
+def finitestate_saver(content, blob_path, **kwargs):
+    # if True:
+    #     return
+    # else:
+    # We will conditionally switch on output folder, as we don't care
+    # for definitions, only harvests. We still need the definitions:
+    # without them, we cannot hope to harvest.
+    output_folder = kwargs['output_dir']
+    if isinstance(content, str):
+        data = json.load(content)
+    else:
+        data = content
+
+    # TODO: We won't really need this directory. It is a stand-in for testing.
+    if not os.path.isdir(output_folder):
+        os.makedirs(output_folder)
+    if output_folder == 'harvests':
+        package_url = data['_metadata']['url']
+        package_type = data['_metadata']['type']
+        # If we've never seen this package before, let's
+        # add it to our dataset
+        if package_url not in harvest_dict:
+            harvest_dict[package_url] = {
+                'clearlydefined': None,
+                'scancode': None,
+                'type': None
+            }
+        if package_type == 'scancode':
+            harvest_dict[package_url]['scancode'] = data
+        # We must be looking at a valid packaging type
+        if package_type in cdutils.PACKAGE_TYPES_BY_PURL_TYPE:
+            harvest_dict[package_url]['clearlydefined'] = data
+            harvest_dict[package_url]['type'] = package_type
+
+        if harvest_dict[package_url]['scancode'] and harvest_dict[package_url]['clearlydefined']:
+            clearlydefined_data: dict = harvest_dict[package_url]['clearlydefined']
+            scancode_data: dict = harvest_dict[package_url]['scancode']
+            package_hash: str = clearlydefined_data['summaryInfo']['hashes']['sha256']
+
+            try:
+                harvest_parser = get_harvest_parser(harvest_dict[package_url]['type'], package_hash, clearlydefined_data, scancode_data)
+                harvest_parser.parse()
+            except Exception:
+                logger.exception("It's broken:")
+
+            # We have completed processing and don't want to leak memory; let's
+            # remove the data from our dictionary.
+            del harvest_dict[package_url]
+
+
 def db_saver(content, blob_path, **kwargs):
     """
     Save `content` bytes (or dict or string) identified by `file_path` to the
@@ -271,22 +351,30 @@ def save_harvest(
 
 
 def fetch_and_save_harvests(
-        coordinate, cache, output_dir=None, save_to_db=False, retries=2,
-        session=session, verbose=True):
+        coordinate, cache, output_dir=None, save_to_db=False,
+        save_to_fstate=False, retries=2, session=None, verbose=True):
     """
     Fetch all the harvests for `coordinate` Coordinate object and save them in
     `outputdir` using blob-style paths, one file for each harvest/scan.
 
     (Note: Return a tuple of (etag, md5, url) for usage as a callback)
     """
-    assert output_dir or save_to_db, 'You must select one of the --output-dir or --save-to-db options.'
+    if not session:
+        session = requests.Session()
+    assert output_dir or save_to_db or save_to_fstate, 'You must select one of the --output-dir or --save-to-db or --save_to_fstate options.'
     if save_to_db:
         from clearcode import dbconf
         dbconf.configure(verbose=verbose)
 
     url = coordinate.get_harvests_api_url()
-    etag, checksum, content = cache.get_content(
-        url, retries=retries, session=session, with_cache_keys=True)
+
+    # SAMV 12 29 let's not use the cache for this
+    # etag, checksum, content = cache.get_content(
+    #     url, retries=retries, session=session, with_cache_keys=True)
+
+    etag, checksum, content = cdutils.get_response_content(
+        url, retries=retries, session=session
+        )
 
     if content:
         savers = []
@@ -294,11 +382,15 @@ def fetch_and_save_harvests(
             savers.append(db_saver)
         if output_dir:
             savers.append(file_saver)
+        if save_to_fstate:
+            output_dir = 'harvests'
+            savers.append(finitestate_saver)
 
         if verbose:
             print('  Fetched harvest for:', coordinate.to_api_path(), flush=True)
         else:
-            print('.', end='', flush=True)
+            pass
+            # print('.', end='', flush=True)
 
         for tool, versions in json.loads(content).items():
             for tool_version, harvest in versions.items():
@@ -320,22 +412,39 @@ class Cache(object):
     """
 
     def __init__(self, max_size=100 * 1000):
-        self.etags_cache = {}
-        self.checksums_cache = {}
+        # self.etags_cache = dict()
+        # self.checksums_cache = dict()
         self.max_size = max_size
 
-    def is_unchanged_remotely(self, url, session=session):
+    def is_unchanged_remotely(self, url, session=None):
         """
         Return True if a `url` content is unchanged from cache based on HTTP
         HEADER Etag.
         """
-        try:
-            response = session.head(url)
-            remote_etag = response.headers.get('etag')
-            if remote_etag and self.etags_cache.get(url) == remote_etag:
-                return True
-        except:
-            return False
+        if session is None:
+            session = requests.Session()
+        # SAMV 1229 Always return false; always go and get it, loser
+        # try:
+        #     response = session.head(url)
+        #     remote_etag = response.headers.get('etag')
+        #     if remote_etag and self.etags_cache.get(url) == remote_etag:
+        #         return True
+        # except:
+        #     return False
+        return False
+
+    @classmethod
+    def local_cache_exists(cls):
+        return os.path.isfile('.cache')
+
+    def dump_to_disk(self):
+        with open('.cache', 'wb') as file_handle:
+            pickle.dump(self, file_handle)
+
+    @classmethod
+    def load_from_disk(cls):
+        with open('.cache', 'rb') as file_handle:
+            return pickle.load(file_handle)
 
     def is_fetched(self, checksum, url):
         """
@@ -344,10 +453,12 @@ class Cache(object):
         return url and checksum and self.checksums_cache.get(checksum) == url
 
     def add(self, etag, checksum, url):
-        if etag:
-            self.etags_cache[url] = etag
-        if checksum:
-            self.checksums_cache[checksum] = url
+        # SAMV 1229 Pass this whole thing, no adding
+        pass
+        # if etag:
+        #     self.etags_cache[url] = etag
+        # if checksum:
+        #     self.checksums_cache[checksum] = url
 
     def add_args(self, args):
         self.add(*args)
@@ -356,21 +467,23 @@ class Cache(object):
         """
         Trim the cache to its max size.
         """
+        # Samv 1229 Pass this whole thing
+        # def _resize(cache):
+        #     extra_items = len(cache) - self.max_size
+        #     if extra_items > 0:
+        #         for ei in list(cache)[:extra_items]:
+        #             del cache[ei]
 
-        def _resize(cache):
-            extra_items = len(cache) - self.max_size
-            if extra_items > 0:
-                for ei in list(cache)[:extra_items]:
-                    del cache[ei]
+        # _resize(self.etags_cache)
+        # _resize(self.checksums_cache)
 
-        _resize(self.etags_cache)
-        _resize(self.checksums_cache)
-
-    def get_content(self, url, retries=1, session=session, with_cache_keys=False):
+    def get_content(self, url, retries=1, session=None, with_cache_keys=False):
         """
         Return fetched content as bytes or None if already fetched or unchanged.
         Updates the cache as needed.
         """
+        if session is None:
+            session = requests.Session()
         if self.is_unchanged_remotely(url=url, session=session):
             return
 
@@ -380,23 +493,24 @@ class Cache(object):
         if not content:
             return
 
-        if self.is_fetched(checksum, url):
-            return
+        return etag, checksum, content
+        # if self.is_fetched(checksum, url):
+        #     return
 
-        self.add(etag, checksum, url)
+        # self.add(etag, checksum, url)
 
-        if with_cache_keys:
-            return etag, checksum, content
-        else:
-            return content
+        # if with_cache_keys:
+        #     return etag, checksum, content
+        # else:
+        #     return content
 
     def copy(self):
         """
         Return a deep copy of self
         """
         cache = Cache(self.max_size)
-        cache.checksums_cache = dict(self.checksums_cache)
-        cache.etags_cache = dict(self.etags_cache)
+        # cache.checksums_cache = dict(self.checksums_cache)
+        # cache.etags_cache = dict(self.etags_cache)
         return cache
 
 
@@ -409,6 +523,10 @@ class Cache(object):
 @click.option('--save-to-db',
     is_flag=True,
     help='Save fetched content as compressed gzipped blobs in the configured database.')
+
+@click.option('--save-to-fstate',
+    is_flag=True,
+    help='Save fetched content to Finite State data repositories.')
 
 @click.option('--unsorted',
     is_flag=True,
@@ -450,17 +568,17 @@ class Cache(object):
     help='Display more verbose progress messages.')
 
 @click.help_option('-h', '--help')
-def cli(output_dir=None, save_to_db=False,
+def cli(output_dir=None, save_to_db=False, save_to_fstate=False,
         base_api_url='https://api.clearlydefined.io',
         wait=60, processes=1, unsorted=False,
-        log_file=None, max_def=0, only_definitions=False, session=session,
+        log_file=None, max_def=0, only_definitions=False, session=global_session,
         verbose=False, *arg, **kwargs):
     """
     Fetch the latest definitions and harvests from ClearlyDefined and save these
     as gzipped JSON either as as files in output-dir or in a PostgreSQL
     database. Loop forever after waiting some seconds between each cycles.
     """
-    assert output_dir or save_to_db, 'You must select at least one of the --output-dir or --save-to-db options.'
+    assert output_dir or save_to_db or save_to_fstate, 'You must select at least one of the --output-dir or --save-to-db or --save-to-fstate options.'
 
     fetch_harvests = not only_definitions
 
@@ -471,7 +589,12 @@ def cli(output_dir=None, save_to_db=False,
     coordinate = None
     file_path = None
 
-    cache = Cache(max_size=100 * 1000)
+    cache = None
+    if Cache.local_cache_exists():
+        cache = Cache.load_from_disk()
+        print(f"Cache max size: {cache.max_size}")
+    else:
+        cache = Cache(max_size=100 * 1000)
 
     sleeping = False
     harvest_fetchers = None
@@ -482,7 +605,9 @@ def cli(output_dir=None, save_to_db=False,
 
     try:
         if fetch_harvests:
-            harvest_fetchers = pool.Pool(processes=processes, maxtasksperchild=10000)
+            # harvest_fetchers = pool.Pool(processes=processes)  #, maxtasksperchild=10)
+            harvest_fetchers = LoggingPool(processes=processes,
+                                           maxtasksperchild=25)  # SAMV 1229
 
         # loop forever. Complete one loop once we have fetched all the latest
         # items and we are not getting new pages (based on etag)
@@ -491,7 +616,6 @@ def cli(output_dir=None, save_to_db=False,
             start = time.time()
             cycles += 1
             cycle_defs_count = 0
-
             # iterate all types to get more depth for the latest defs.
             for def_type in known_types:
                 sleeping = False
@@ -507,13 +631,31 @@ def cli(output_dir=None, save_to_db=False,
                     base_api_url=def_api_url,
                     output_dir=output_dir,
                     save_to_db=save_to_db,
+                    save_to_fstate=save_to_fstate,
                     cache=cache,
                     by_latest=not unsorted,
                     verbose=verbose)
 
                 for coordinate, file_path in definitions:
-
                     cycle_defs_count += 1
+                    if (cycle_defs_count + total_defs_count) % 1000 == 0:
+                        # print("=" * 50)
+                        # print(f"POOL CACHE SIZE: {len(harvest_fetchers._cache)}")
+                        # print("=" * 50)
+                        # if len(harvest_fetchers._cache) > 500:
+                        #     exponent = 1
+                        #     while len(harvest_fetchers._cache) > 500:
+                        #         print("=" * 50)
+                        #         print(f"POOL CACHE SIZE: {len(harvest_fetchers._cache)}")
+                        #         print("=" * 50)
+                        #         print(f"Cache 2 big. Sleeping for {2 ** exponent} seconds before asking for more harvests..")
+                        #         print("=" * 50)
+                        #         time.sleep(2 ** exponent)
+                        #         exponent += 1
+
+                        print("Caching for posterity.")
+                        cache.dump_to_disk()
+                        cache.trim()
 
                     if log_file:
                         log_file_fn.write(file_path.partition('.gz')[0] + '\n')
@@ -525,10 +667,15 @@ def cli(output_dir=None, save_to_db=False,
                             coordinate=coordinate,
                             output_dir=output_dir,
                             save_to_db=save_to_db,
+                            save_to_fstate=save_to_fstate,
                             # that's a copy of the cache, since we are in some
                             # subprocess, the data is best not shared to avoid
                             # any sync issue
-                            cache=cache.copy(),
+                            # SAMV December 29 2020
+                            # We're gonna reuse the cache that exists so we
+                            # don't blow up memory
+                            # cache=cache.copy(),
+                            cache=None,
                             verbose=verbose)
 
                         harvest_fetchers.apply_async(
@@ -536,11 +683,26 @@ def cli(output_dir=None, save_to_db=False,
                             kwds=kwds,
                             callback=cache.add_args)
 
-                    if max_def and max_def >= cycle_defs_count:
+                    if max_def and max_def <= cycle_defs_count:
                         break
 
-                if max_def and (max_def >= cycle_defs_count or max_def >= total_defs_count):
+                if max_def and (max_def <= cycle_defs_count or max_def <= total_defs_count):
                     break
+
+            # snapshot = tracemalloc.take_snapshot()
+            # top_stats = snapshot.statistics('traceback')
+
+            # print()
+            # print("=============== MEMORY USAGE TOP 10 LINES ================")
+            # for stat in top_stats[:10]:
+            #     print("THE STAT:")
+            #     print(stat)
+            #     print("THE TRACEBACK:")
+            #     print(f"{stat.count} memory blocks: {stat.size / 1024} KiB")
+            #     for line in stat.traceback.format():
+            #         print(line)
+            # print("==========================================================")
+            # print()
 
             total_defs_count += cycle_defs_count
             cycle_duration = time.time() - start
@@ -557,7 +719,8 @@ def cli(output_dir=None, save_to_db=False,
                 print('Cycle completed at:', datetime.utcnow().isoformat(),
                       'Sleeping for', wait, 'seconds...')
             else:
-                print('.', end='')
+                pass
+                # print('.', end='')
 
             sleeping = True
             time.sleep(wait)
@@ -565,8 +728,10 @@ def cli(output_dir=None, save_to_db=False,
 
     except KeyboardInterrupt:
         click.secho('\nAborted with Ctrl+C!', fg='red', err=True)
-        return
 
+        return
+    except Exception as e:
+        raise e
     finally:
         if log_file:
             log_file_fn.close()
@@ -574,6 +739,9 @@ def cli(output_dir=None, save_to_db=False,
         if harvest_fetchers:
             harvest_fetchers.close()
             harvest_fetchers.terminate()
+
+        print("Dumping cache to disk at .cache, please wait...")
+        cache.dump_to_disk()
 
         print('TOTAL cycles:', cycles,
               'with:', total_defs_count, 'defs and combined harvests,',

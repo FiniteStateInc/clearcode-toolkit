@@ -1,0 +1,227 @@
+{
+  "$schema": "http://json-schema.org/schema",
+  "$id": "http://finitestate.io/schemas/fs_sbom.json",
+  "title": "Finite State Software Bill of Materials",
+  "definitions": {
+    "component_description": {
+      "type": "object",
+      "properties": {
+        "short": {
+          "type": ["string", "null"]
+        },
+        "long": {
+          "type": ["string", "null"]
+        }
+      }
+    },
+
+    "component_external_reference": {
+      "type": "object",
+      "properties": {
+        "url": {
+          "type": "string"
+        },
+        "type": {
+          "enum": ["issue-tracker", "website"]
+        }
+      },
+      "required": ["url", "type"]
+    },
+
+    "file_evidence": {
+      "type": "object",
+      "properties": {
+        "type": {
+          "enum": [
+            "apt-file",
+            "fact-signature",
+            "string-similarity",
+            "vxworks-services",
+            "manual"
+          ]
+        },
+        "confidence_score": {
+          "type": ["number", "null"]
+        },
+        "description": {
+          "type": ["string", "null"]
+        }
+      },
+      "required": ["type"]
+    },
+
+    "component_file": {
+      "type": "object",
+      "properties": {
+        "hashes": {
+          "type": "object",
+          "propertyNames": {
+            "enum": ["sha256"]
+          },
+          "patternProperties": {
+            "": {
+              "type": "string"
+            }
+          },
+          "required": ["sha256"]
+        },
+        "names": {
+          "type": ["array", "null"],
+          "items": {
+            "type": "string"
+          }
+        },
+        "evidence": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/file_evidence"
+          }
+        }
+      },
+      "required": ["hashes", "evidence"]
+    },
+
+    "path_evidence": {
+      "type": "object",
+      "properties": {
+        "type": {
+          "enum": [
+            "file-path",
+            "manual"
+          ]
+        },
+        "confidence_score": {
+          "type": ["number", "null"]
+        },
+        "description": {
+          "type": ["string", "null"]
+        }
+      },
+      "required": ["type"]
+    },
+
+    "component_path": {
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "evidence": {
+          "type": ["array", "null"],
+          "items": {
+            "$ref": "#/definitions/path_evidence"
+          }
+        }
+      }
+    },
+
+    "component": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "purl": {
+          "type": "string"
+        },
+        "version": {
+          "type": ["string", "null"]
+        },
+        "description": {
+          "$ref": "#/definitions/component_description"
+        },
+        "external_references": {
+          "type": ["array", "null"],
+          "items": {
+            "$ref": "#/definitions/component_external_reference"
+          },
+          "default": []
+        },
+        "files": {
+          "type": ["array", "null"],
+          "items": {
+            "$ref": "#/definitions/component_file"
+          }
+        },
+        "paths": {
+          "type": ["array", "null"],
+          "items": {
+            "$ref": "#/definitions/component_path"
+          }
+        },
+        "status": {
+          "enum": [
+            null,
+            "USER_EXCLUDED_INCORRECT_VERSION",
+            "USER_EXCLUDED_INVALID_COMPONENT"
+          ]
+        }
+      },
+      "required": ["name", "purl"]
+    },
+
+    "component_ref": {
+      "type": "object",
+      "properties": {
+        "purl": {
+          "type": "string"
+        }
+      },
+      "required": ["purl"]
+    },
+
+    "component_relationship": {
+      "type": "object",
+      "properties": {
+        "source": {
+          "$ref": "#/definitions/component_ref"
+        },
+        "target": {
+          "$ref": "#/definitions/component_ref"
+        },
+        "type": {
+          "enum": ["source"]
+        },
+        "description": {
+          "type": ["string", "null"]
+        }
+      },
+      "required": ["source", "target", "type"]
+    }
+  },
+
+  "type": "object",
+
+  "properties": {
+    "firmware_hash": {
+      "type": "string"
+    },
+    "created_at": {
+      "type": ["string", "null"],
+      "format": "date-time"
+    },
+    "components": {
+      "type": "array",
+      "items": {
+        "allOf": [
+          { "$ref": "#/definitions/component" },
+          {
+            "properties": {
+              "confidence_score": {
+                "type": ["number", "null"]
+              }
+            }
+          }
+        ]
+      },
+      "default": []
+    },
+    "relationships": {
+      "type": ["array", "null"],
+      "items": {
+        "$ref": "#/definitions/component_relationship"
+      }
+    }
+  },
+
+  "required": ["firmware_hash", "components"]
+}

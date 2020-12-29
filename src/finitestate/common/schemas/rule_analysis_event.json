@@ -1,0 +1,56 @@
+{
+  "$schema": "http://json-schema.org/draft-04/schema#",
+  "title": "Schema for RuleAnalysis event",
+  "type": "object",
+  "required": [
+    "rule_set_id",
+    "rule_proposal_set_id",
+    "affected_devices_percent_change",
+    "affected_devices_total",
+    "affected_devices"
+  ],
+  "properties": {
+    "rule_set_id": { "type": "string" },
+    "rule_proposal_set_id": { "type": "string" },
+    "affected_devices_percent_change": { "type": "number" },
+    "affected_devices_total": { "type": "integer" },
+    "affected_devices": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["aggregate_id", "diffs"],
+        "properties": {
+          "aggregate_id": { "type": "string" },
+          "diffs": {
+            "type": "array",
+            "required": [
+              "diff_type",
+              "previous_value",
+              "new_value",
+              "rule_proposal_id"
+            ],
+            "properties": {
+              "diff_type": {
+                "type": " string",
+                "enum": [
+                  "PRODUCT_MODEL_CHANGED",
+                  "PRODUCT_FAMILY_CHANGED",
+                  "PRODUCT_CATEGORY_CHANGED",
+                  "PRODUCT_BRAND_CHANGED",
+                  "OPERATING_SYSTEM_KERNEL_FAMILY_CHANGED",
+                  "OPERATING_SYSTEM_KERNEL_VERSION_CHANGED",
+                  "OPERATING_SYSTEM_PRODUCT_VERSION_CHANGED",
+                  "OPERATING_SYSTEM_PRODUCT_CHANGED",
+                  "OPERATING_SYSTEM_VENDOR_CHANGED"
+                ]
+              },
+              "previous_value": { "type": "string" },
+              "new_value": { "type": "string" },
+              "rule_proposal_id": { "type": "string" }
+            }
+          }
+        }
+      }
+    }
+  }
+}

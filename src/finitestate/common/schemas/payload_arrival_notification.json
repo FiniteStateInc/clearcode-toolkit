@@ -1,0 +1,9 @@
+{
+    "$schema"	 : "http://json-schema.org/draft-04/schema#",
+    "title"	 : "Schema for notification of arrival of payloads in S3",
+    "type"	 : "object",
+    "required"	 : ["payload_s3_uri"],
+    "properties" : {
+	"payload_s3_uri"   : { "type" : "string" }
+    }
+}

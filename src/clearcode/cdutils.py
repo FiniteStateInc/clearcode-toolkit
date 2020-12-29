@@ -330,7 +330,7 @@ def get_coordinates(data_dir):
             yield pth, Coordinate.from_path(cdpth)
 
 
-def _get_response_content(url, retries=2, wait=2, session=requests, verbose=False, _retries=set()):
+def _get_response_content(url, retries=1, wait=2, session=requests, verbose=False, _retries=set()):
     """
     Return a tuple of (etag, md5, content bytes) with the content as bytes or as decoded
     text if `as_text` is True) of the response of a GET HTTP request at `url`.
@@ -356,9 +356,9 @@ def _get_response_content(url, retries=2, wait=2, session=requests, verbose=Fals
 
     error_code = requests.codes.get(status_code) or ''
 
-    if status_code >= 500 and retries:
+    if (status_code >= 500 or status_code == 429) and retries:
         # timeout/522 or other server error: let's wait a bit and retry for "retries" number of retries
-        retries -= 1
+        retries += 1
         print(' Failure to fetch:', url, 'with', status_code, error_code, 'retrying after waiting:', wait, 'seconds.')
         _retries.add(url)
         time.sleep(wait)
@@ -369,7 +369,7 @@ def _get_response_content(url, retries=2, wait=2, session=requests, verbose=Fals
     raise Exception('Failed HTTP request for {url} : error: {status_code} : {error_code}'.format(**locals()))
 
 
-def get_response_content(url, retries=2, wait=4, session=requests, verbose=False):
+def get_response_content(url, retries=1, max_retries=4, wait=4, session=requests, verbose=False):
     """
     Return the bytes of the response of a GET HTTP request at `url`, an md5 checksum and the URL etag.
     On failures, retry up to `retries` time after waiting `wait` seconds.
@@ -379,16 +379,17 @@ def get_response_content(url, retries=2, wait=4, session=requests, verbose=False
                 url=url, retries=retries, wait=wait,
                 session=session, verbose=verbose)
     except Exception as e:
-        if retries:
-            print(' Failure to fetch:', url, 'with error:', e, 'and retrying after waiting:', wait, 'seconds.')
+        if retries and retries < max_retries:
+            exponential_wait = wait ** retries if retries else wait
+            print(f' Failure to fetch {url} with error {e}; retrying after waiting {exponential_wait} seconds.')
             # we sleep progressively more after each failure and up to wait seconds
-            time.sleep(int(wait / (retries or 1)))
-            retries -= 1
+            time.sleep(int(exponential_wait))
+            retries += 1
             return get_response_content(
                 url=url, retries=retries, wait=wait,
                 session=session, verbose=verbose)
         else:
-            raise
+            raise Exception(f' Failed to fetch {url} with error {e} after {max_retries} tries.')
 
 
 def split_url(url):
