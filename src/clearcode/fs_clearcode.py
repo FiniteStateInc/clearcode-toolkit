@@ -19,6 +19,8 @@ STAGE = 'dev2'
 ACCOUNT_ID = '185231689230'
 FILE_BUCKET = f"finitestate-firmware-{STAGE}-files"
 METADATA_BUCKET = f"finitestate-firmware-{STAGE}-metadata"
+# FILE_BUCKET = f"finitestate-software-component-dev2-scraper"
+# METADATA_BUCKET = "finitestate-software-component-dev2-scraper"
 PLUGIN_NAME = 'package_metadata'
 PRIORITY = 'low'
 REGION = 'us-east-1'
@@ -37,8 +39,6 @@ logging.getLogger('finitestate.firmware.plugins.storage.aws_adapter').setLevel(l
 logging.getLogger('botocore').setLevel(logging.CRITICAL)
 logger = logging.getLogger(__name__)
 
-sent_count = 0
-
 
 def get_storage_adapter():
     global storage_adapter
@@ -55,10 +55,9 @@ def get_sqs_client():
 
 
 class HarvestParser(ABC):
-    def __init__(self, package_hash: str, clearlydefined_data: dict, scancode_data: dict):
+    def __init__(self, package_hash: str, clearlydefined_data: dict):
         self.package_hash = package_hash
         self.clearlydefined_data = clearlydefined_data
-        self.scancode_data = scancode_data
         self.storage_adapter = get_storage_adapter()
 
     def _construct_file_tree(self) -> List[dict]:
@@ -80,19 +79,8 @@ class HarvestParser(ABC):
         for file_entry in self.clearlydefined_data['files']:
             transformed_data[file_entry['path']] = {
                 'harvest_info': file_entry,
-                'scancode_info': dict()
             }
 
-        for file_entry in self.scancode_data['content']['files']:
-            # We do not want to think about directories.
-            if file_entry['type'] == 'file':
-                if file_entry['path'] not in transformed_data:
-                    transformed_data[file_entry['path']] = {
-                        'harvest_info': dict(),
-                        'scancode_info': file_entry
-                    }
-                else:
-                    transformed_data[file_entry['path']]['scancode_info'] = file_entry
 
         # Construct the file tree using the transformed data
         file_tree = list()
@@ -131,11 +119,11 @@ class HarvestParser(ABC):
                     'file_hash': info.get('harvest_info', dict()).get('hashes', dict()).get('sha256', None),
                     'file_full_path': file_path,
                     'file_name': os.path.basename(file_path),
-                    'file_size': info.get('scancode_info', dict()).get('size', 0),
+                    'file_size': 1,
                     # We don't want to accidentally process anything as a binary who is not.
-                    'file_type_mime': info.get('scancode_info', dict()).get('mime_type', 'text/plain'),
+                    'file_type_mime': 'clearlydefined/unknown',
                     # Make sure we can query for these, if need be.
-                    'file_type_full': info.get('scancode_info', dict()).get('file_type', 'ClearlyDefined Unknown'),
+                    'file_type_full': 'Data from ClearlyDefined of Unknown Type',
                 }
             )
 
@@ -173,23 +161,26 @@ class HarvestParser(ABC):
         message = FSFirmwareUnpackedMessage(firmware_id=self.package_hash,
                                             fwan_process_id=str(uuid.uuid4()),
                                             trigger_downstream_plugins=True)
-        logger.info(
-            f"{self.package_hash} -> SQS"
-        )
-        global sent_count
-        sent_count += 1
-        get_sqs_client().send_message(
-            QueueUrl=queue_url,
-            MessageBody=message.serialize()
-        )
-        if sent_count % 250 == 0:
-            logger.info(f"{sent_count} packages processed.")
+        try:
+            get_sqs_client().send_message(
+                QueueUrl=queue_url,
+                MessageBody=message.serialize()
+            )
+            logger.info(
+                f"{self.package_hash} -> SQS"
+            )
+        except Exception:
+            logger.info("FAILED TO SEND TO SQS")
+
 
     @abstractmethod
     def _construct_standardized_metadata(self) -> Union[dict, None]:
         raise NotImplementedError("Function not implemented!")
 
-    def parse(self):
+    def parse(self) -> bool:
+        if storage_adapter.metadata_exists(file_id=self.package_hash, location='file_tree'):
+            logger.info(f"Metadata exists for package f{self.package_hash}! NOT building new metadata; returning.")
+            return False
         file_tree: List[dict] = self._construct_file_tree()
 
         ground_truth_upload_metadata: dict = self._construct_ground_truth_upload_metadata()
@@ -206,11 +197,12 @@ class HarvestParser(ABC):
             storage_adapter.store_metadata(file_id=self.package_hash,
                                            output_location="package_metadata/standardized",
                                            result=[standardized_package_metadata])
+        return True
 
 
 class NPMHarvestParser(HarvestParser):
-    def __init__(self, package_hash: str, clearlydefined_data: dict, scancode_data: dict):
-        super().__init__(package_hash, clearlydefined_data, scancode_data)
+    def __init__(self, package_hash: str, clearlydefined_data: dict):
+        super().__init__(package_hash, clearlydefined_data)
 
     def _get_package_json(self):
         package_json_sha256_digest = str()
@@ -243,20 +235,21 @@ class NPMHarvestParser(HarvestParser):
 
     def parse(self):
         # Do everything defined in ABC
-        super().parse()
-        package_json_data: dict = self._get_package_json()
-        try:
-            upload_data_to_s3(bucket=FILE_BUCKET,
-                              key=package_json_data['package_json_hash'],
-                              data=json.dumps(package_json_data['package_json'], indent=True))
-        except Exception:
-            raise
+        parsing_complete = super().parse()
+        if parsing_complete:
+            package_json_data: dict = self._get_package_json()
+            try:
+                upload_data_to_s3(bucket=FILE_BUCKET,
+                                  key=package_json_data['package_json_hash'],
+                                  data=json.dumps(package_json_data['package_json'], indent=True))
+            except Exception:
+                raise
 
-        self._trigger_package_metadata_plugin()
+            self._trigger_package_metadata_plugin()
 
 
-def get_harvest_parser(package_type: str, package_hash: str, clearlydefined_data: dict, scancode_data: dict) -> HarvestParser:
+def get_harvest_parser(package_type: str, package_hash: str, clearlydefined_data: dict) -> HarvestParser:
     if package_type == 'npm':
-        return NPMHarvestParser(package_hash, clearlydefined_data, scancode_data)
+        return NPMHarvestParser(package_hash, clearlydefined_data)
     else:
         raise NotImplementedError(f"Harvest Parser not implemented for package type {package_type}!")

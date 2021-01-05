@@ -31,11 +31,10 @@ from typing import List
 
 from datetime import datetime
 from expiring_dict import ExpiringDict
-from itertools import repeat
-# from multiprocessing import pool
+
+from multiprocessing import pool, Value
 from .logging_pool import LoggingPool
 from os import path
-from random import randrange
 
 from django.utils import timezone
 
@@ -75,6 +74,8 @@ TRACE = False
 HARVEST_TTL = 60
 HARVEST_TTL_INTERVAL = 5
 
+counter = None
+
 logger = logging.getLogger(__name__)
 
 # A dictionary to hold our data
@@ -105,6 +106,10 @@ known_types = (
 # each process gets its own session
 global_session = requests.Session()
 
+
+def init(args):
+    global counter
+    counter = args
 
 
 def fetch_and_save_latest_definitions(
@@ -223,7 +228,7 @@ def compress(content):
     if isinstance(content, str):
         content = content.encode('utf-8')
     else:
-        content = json.dumps(content , separators=(',', ':')).encode('utf-8')
+        content = json.dumps(content, separators=(',', ':')).encode('utf-8')
     return gzip.compress(content, compresslevel=9)
 
 
@@ -236,7 +241,7 @@ def file_saver(content, blob_path, output_dir, **kwargs):
     compressed = compress(content)
 
     if path.exists(file_path):
-        with open(file_path , 'rb') as ef:
+        with open(file_path, 'rb') as ef:
             existing = ef.read()
             if existing == compressed:
                 return 0
@@ -244,7 +249,7 @@ def file_saver(content, blob_path, output_dir, **kwargs):
         parent_dir = path.dirname(file_path)
         os.makedirs(parent_dir, exist_ok=True)
 
-    with open(file_path , 'wb') as oi:
+    with open(file_path, 'wb') as oi:
         if TRACE:
             print('Saving:', blob_path)
         oi.write(compressed)
@@ -270,36 +275,48 @@ def finitestate_saver(content, blob_path, **kwargs):
     if output_folder == 'harvests':
         package_url = data['_metadata']['url']
         package_type = data['_metadata']['type']
+        print(f'PACKAGE TYPE: {package_type}')
+
         # If we've never seen this package before, let's
         # add it to our dataset
         if package_url not in harvest_dict:
             harvest_dict[package_url] = {
                 'clearlydefined': None,
-                'scancode': None,
+                # 'scancode': None,
                 'type': None
             }
-        if package_type == 'scancode':
-            harvest_dict[package_url]['scancode'] = data
+        # if package_type == 'scancode':
+        #     harvest_dict[package_url]['scancode'] = data
         # We must be looking at a valid packaging type
         if package_type in cdutils.PACKAGE_TYPES_BY_PURL_TYPE:
             harvest_dict[package_url]['clearlydefined'] = data
             harvest_dict[package_url]['type'] = package_type
 
-        if harvest_dict[package_url]['scancode'] and harvest_dict[package_url]['clearlydefined']:
+        if harvest_dict[package_url]['clearlydefined']:
             clearlydefined_data: dict = harvest_dict[package_url]['clearlydefined']
-            scancode_data: dict = harvest_dict[package_url]['scancode']
-            package_hash: str = clearlydefined_data['summaryInfo']['hashes']['sha256']
+            # scancode_data: dict = harvest_dict[package_url]['scancode']
+            if 'summaryInfo' in clearlydefined_data.keys():
 
-            try:
-                harvest_parser = get_harvest_parser(harvest_dict[package_url]['type'], package_hash, clearlydefined_data, scancode_data)
-                harvest_parser.parse()
-            except Exception:
-                logger.exception("It's broken:")
+                package_hash: str = clearlydefined_data['summaryInfo']['hashes']['sha256']
 
-            # We have completed processing and don't want to leak memory; let's
-            # remove the data from our dictionary.
+                try:
+                    harvest_parser = get_harvest_parser(harvest_dict[package_url]['type'], package_hash, clearlydefined_data)
+                    harvest_parser.parse()
+                    global counter
+                    with counter.get_lock():
+                        counter.value += 1
+                    if (counter.value % 100) == 0:
+                        logger.info(f"{counter.value} packages sent.")
+                except Exception:
+                    logger.exception("It's broken:")
+
+                # We have completed processing and don't want to leak memory; let's
+                # remove the data from our dictionary.
+            else:
+                logger.critical(f"No package hash for package at {package_url}; NOT continuing, doing NOTHING.")
             del harvest_dict[package_url]
-
+    else:
+        print(f'Non-harvest output folder: {output_folder}')
 
 def db_saver(content, blob_path, **kwargs):
     """
@@ -390,7 +407,6 @@ def fetch_and_save_harvests(
             print('  Fetched harvest for:', coordinate.to_api_path(), flush=True)
         else:
             pass
-            # print('.', end='', flush=True)
 
         for tool, versions in json.loads(content).items():
             for tool_version, harvest in versions.items():
@@ -515,58 +531,46 @@ class Cache(object):
 
 
 @click.command()
-
 @click.option('--output-dir',
-    type=click.Path(), metavar='DIR',
-    help='Save fetched content as compressed gzipped files to this output directory.')
-
+              type=click.Path(), metavar='DIR',
+              help='Save fetched content as compressed gzipped files to this output directory.')
 @click.option('--save-to-db',
-    is_flag=True,
-    help='Save fetched content as compressed gzipped blobs in the configured database.')
-
+              is_flag=True,
+              help='Save fetched content as compressed gzipped blobs in the configured database.')
 @click.option('--save-to-fstate',
-    is_flag=True,
-    help='Save fetched content to Finite State data repositories.')
-
+              is_flag=True,
+              help='Save fetched content to Finite State data repositories.')
 @click.option('--unsorted',
-    is_flag=True,
-    help='Fetch data without any sorting. The default is to fetch data sorting by latest updated first.')
-
+              is_flag=True,
+              help='Fetch data without any sorting. The default is to fetch data sorting by latest updated first.')
 @click.option('--base-api-url',
-    type=str,
-    default='https://api.clearlydefined.io', show_default=True,
-    help='ClearlyDefined base API URL.')
-
+              type=str,
+              default='https://api.clearlydefined.io', show_default=True,
+              help='ClearlyDefined base API URL.')
 @click.option('--wait',
-    type=int, metavar='INT',
-    default=60, show_default=True,
-    help='Set the number of seconds to wait for new or updated definitions '
-         'between two loops.')
-
+              type=int, metavar='INT',
+              default=60, show_default=True,
+              help='Set the number of seconds to wait for new or updated definitions '
+              'between two loops.')
 @click.option('-n', '--processes',
-    type=int, metavar='INT',
-    default=1, show_default=True,
-    help='Set the number of parallel processes to use. '
-         'Disable parallel processing if 0.')
-
+              type=int, metavar='INT',
+              default=1, show_default=True,
+              help='Set the number of parallel processes to use. '
+                   'Disable parallel processing if 0.')
 @click.option('--max-def',
-    type=int, metavar='INT',
-    default=0,
-    help='Set the maximum number of definitions to fetch.')
-
+              type=int, metavar='INT',
+              default=0,
+              help='Set the maximum number of definitions to fetch.')
 @click.option('--only-definitions',
-    is_flag=True,
-    help='Only fetch definitions and no other data item.')
-
+              is_flag=True,
+              help='Only fetch definitions and no other data item.')
 @click.option('--log-file',
-    type=click.Path(), default=None,
-    help='Path to a file where to log fetched paths, one per line. '
-         'Log entries will be appended to this file if it exists.')
-
+              type=click.Path(), default=None,
+              help='Path to a file where to log fetched paths, one per line. '
+              'Log entries will be appended to this file if it exists.')
 @click.option('--verbose',
-    is_flag=True,
-    help='Display more verbose progress messages.')
-
+              is_flag=True,
+              help='Display more verbose progress messages.')
 @click.help_option('-h', '--help')
 def cli(output_dir=None, save_to_db=False, save_to_fstate=False,
         base_api_url='https://api.clearlydefined.io',
@@ -590,11 +594,11 @@ def cli(output_dir=None, save_to_db=False, save_to_fstate=False,
     file_path = None
 
     cache = None
-    if Cache.local_cache_exists():
-        cache = Cache.load_from_disk()
-        print(f"Cache max size: {cache.max_size}")
-    else:
-        cache = Cache(max_size=100 * 1000)
+    # if Cache.local_cache_exists():
+    #     cache = Cache.load_from_disk()
+    #     print(f"Cache max size: {cache.max_size}")
+    # else:
+    cache = Cache(max_size=100 * 1000)
 
     sleeping = False
     harvest_fetchers = None
@@ -605,10 +609,12 @@ def cli(output_dir=None, save_to_db=False, save_to_fstate=False,
 
     try:
         if fetch_harvests:
-            # harvest_fetchers = pool.Pool(processes=processes)  #, maxtasksperchild=10)
-            harvest_fetchers = LoggingPool(processes=processes,
+            counter = Value('i', 0)
+            # harvest_fetchers = pool.Pool(processes=processes)  # maxtasksperchild=10)
+            harvest_fetchers = LoggingPool(initializer=init,
+                                           initargs=(counter, ),
+                                           processes=processes,
                                            maxtasksperchild=25)  # SAMV 1229
-
         # loop forever. Complete one loop once we have fetched all the latest
         # items and we are not getting new pages (based on etag)
         # Sleep between each loop
@@ -626,7 +632,6 @@ def cli(output_dir=None, save_to_db=False, save_to_fstate=False,
                 else:
                     # do nothing if we have no type
                     def_api_url = base_api_url
-
                 definitions = fetch_and_save_latest_definitions(
                     base_api_url=def_api_url,
                     output_dir=output_dir,
@@ -639,28 +644,14 @@ def cli(output_dir=None, save_to_db=False, save_to_fstate=False,
                 for coordinate, file_path in definitions:
                     cycle_defs_count += 1
                     if (cycle_defs_count + total_defs_count) % 1000 == 0:
-                        # print("=" * 50)
-                        # print(f"POOL CACHE SIZE: {len(harvest_fetchers._cache)}")
-                        # print("=" * 50)
-                        # if len(harvest_fetchers._cache) > 500:
-                        #     exponent = 1
-                        #     while len(harvest_fetchers._cache) > 500:
-                        #         print("=" * 50)
-                        #         print(f"POOL CACHE SIZE: {len(harvest_fetchers._cache)}")
-                        #         print("=" * 50)
-                        #         print(f"Cache 2 big. Sleeping for {2 ** exponent} seconds before asking for more harvests..")
-                        #         print("=" * 50)
-                        #         time.sleep(2 ** exponent)
-                        #         exponent += 1
-
-                        print("Caching for posterity.")
                         cache.dump_to_disk()
                         cache.trim()
 
                     if log_file:
                         log_file_fn.write(file_path.partition('.gz')[0] + '\n')
 
-                    if TRACE: print('  Saved def for:', coordinate)
+                    if TRACE:
+                        print('  Saved def for:', coordinate)
 
                     if fetch_harvests:
                         kwds = dict(
@@ -688,21 +679,6 @@ def cli(output_dir=None, save_to_db=False, save_to_fstate=False,
 
                 if max_def and (max_def <= cycle_defs_count or max_def <= total_defs_count):
                     break
-
-            # snapshot = tracemalloc.take_snapshot()
-            # top_stats = snapshot.statistics('traceback')
-
-            # print()
-            # print("=============== MEMORY USAGE TOP 10 LINES ================")
-            # for stat in top_stats[:10]:
-            #     print("THE STAT:")
-            #     print(stat)
-            #     print("THE TRACEBACK:")
-            #     print(f"{stat.count} memory blocks: {stat.size / 1024} KiB")
-            #     for line in stat.traceback.format():
-            #         print(line)
-            # print("==========================================================")
-            # print()
 
             total_defs_count += cycle_defs_count
             cycle_duration = time.time() - start
